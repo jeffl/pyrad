@@ -7,9 +7,46 @@ import socket
 from pyrad import host
 from pyrad import packet
 import logging
-
+from Queue import Queue
+from threading import Thread
 
 logger = logging.getLogger('pyrad')
+
+class TWorker(Thread):
+    """ Thread executing tasks from a given tasks queue """
+    def __init__(self, tasks):
+        Thread.__init__(self)
+        self.tasks = tasks
+        self.daemon = True
+        self.start()
+
+    def run(self):
+        while True:
+            func, args, kargs = self.tasks.get()
+            try:
+                func(*args, **kargs)
+            except Exception as e:
+                # An exception happened in this thread
+                logger.exception(e)
+            finally:
+                # Mark this task as done, whether an exception happened or not
+                self.tasks.task_done()
+
+class ThreadPool:
+    """ Pool of threads consuming tasks from a queue """
+    def __init__(self, num_threads):
+        self.tasks = Queue(num_threads)
+        for _ in range(num_threads):
+            TWorker(self.tasks)
+
+    def add_task(self, func, *args, **kargs):
+        """ Add a task to the queue """
+        self.tasks.put((func, args, kargs))
+
+    def wait_completion(self):
+        """ Wait for completion of all the tasks in the queue """
+        self.tasks.join()
+
 
 
 class RemoteHost:
@@ -186,7 +223,9 @@ class Server(host.Host):
         if pkt.code != packet.AccessRequest:
             raise ServerPacketError(
                 'Received non-authentication packet on authentication port')
-        self.HandleAuthPacket(pkt)
+
+        #logger.info("handling auth packet %s" % pkt)
+        self.pool.add_task(self.HandleAuthPacket,pkt)
 
     def _HandleAcctPacket(self, pkt):
         """Process a packet received on the accounting port.
@@ -205,7 +244,7 @@ class Server(host.Host):
                             packet.AccountingResponse]:
             raise ServerPacketError(
                     'Received non-accounting packet on accounting port')
-        self.HandleAcctPacket(pkt)
+        self.pool.add_task(self.HandleAcctPacket,pkt)
 
     def _HandleCoaPacket(self, pkt):
         """Process a packet received on the coa port.
@@ -221,9 +260,9 @@ class Server(host.Host):
 
         pkt.secret = self.hosts[pkt.source[0]].secret
         if pkt.code == packet.CoARequest:
-            self.HandleCoaPacket(pkt)
+            self.pool.add_task(self.HandleCoaPacket,pkt)
         elif pkt.code == packet.DisconnectRequest:
-            self.HandleDisconnectPacket(pkt)
+            self.pool.add_task(self.HandleDisconnectPacket,pkt)
         else:
             raise ServerPacketError('Received non-coa packet on coa port')
 
@@ -283,6 +322,7 @@ class Server(host.Host):
         """
         if fd.fileno() in self._realauthfds:
             pkt = self._GrabPacket(lambda data, s=self: s.CreateAuthPacket(packet=data), fd)
+	        #logger.info(pkt.source[0])
             self._HandleAuthPacket(pkt)
         elif fd.fileno() in self._realacctfds:
             pkt = self._GrabPacket(lambda data, s=self: s.CreateAcctPacket(packet=data), fd)
@@ -290,6 +330,16 @@ class Server(host.Host):
         else:
             pkt = self._GrabPacket(lambda data, s=self: s.CreateCoAPacket(packet=data), fd)
             self._HandleCoaPacket(pkt)
+
+    def doProcessWork(self,fd):
+        try:
+            fdo = self._fdmap[fd]
+            self._ProcessInput(fdo)
+        except ServerPacketError as err:
+            logger.info('Dropping packet: ' + str(err))
+        except packet.PacketError as err:
+            logger.info('Received a broken packet: ' + str(err))
+
 
     def Run(self):
         """Main loop.
@@ -300,16 +350,12 @@ class Server(host.Host):
         self._poll = select.poll()
         self._fdmap = {}
         self._PrepareSockets()
+        self.pool = ThreadPool(16)
 
         while True:
             for (fd, event) in self._poll.poll():
                 if event == select.POLLIN:
-                    try:
-                        fdo = self._fdmap[fd]
-                        self._ProcessInput(fdo)
-                    except ServerPacketError as err:
-                        logger.info('Dropping packet: ' + str(err))
-                    except packet.PacketError as err:
-                        logger.info('Received a broken packet: ' + str(err))
+                    self.doProcessWork(fd)
                 else:
                     logger.error('Unexpected event in server main loop')
+
